@@ -1,0 +1,293 @@
+//@version=6
+// =====================================================================
+//  ORDER BLOCKS + VOLUME STRENGTH  (BOS / CHoCH / MTF Bias)
+//  - Detects bullish & bearish order blocks from structure breaks
+//  - Measures FORMATION volume inside the block  -> "1.105K (16%)"
+//  - Measures RETEST volume separately           -> "R: 0.42K"
+//  - Multi-timeframe bias table (15m / 1H / 4H / 1D)
+// =====================================================================
+indicator("OB + Volume Strength", "OB+VOL", overlay = true,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ---------------------------------------------------------------------
+// INPUTS
+// ---------------------------------------------------------------------
+grpS = "Structure"
+swingLen   = input.int(5,    "Swing length (pivot)",        minval = 2, group = grpS)
+useDisp    = input.bool(true,"Require displacement move",   group = grpS)
+dispMult   = input.float(1.0,"Displacement = ATR x",        minval = 0.1, step = 0.1, group = grpS)
+atrLen     = input.int(14,   "ATR length",                  minval = 1, group = grpS)
+showBOS    = input.bool(true,"Show BOS / CHoCH labels",     group = grpS)
+
+grpO = "Order Blocks"
+obSearch   = input.int(12,   "Bars to search back for OB",  minval = 1, maxval = 50, group = grpO)
+useWick    = input.bool(true,"Use full wick (off = body)",  group = grpO)
+maxOB      = input.int(6,    "Max live OBs per side",       minval = 1, maxval = 20, group = grpO)
+extendBars = input.int(30,   "Extend box (bars)",           minval = 0, group = grpO)
+showMid    = input.bool(true,"Show 50% equilibrium band",   group = grpO)
+mitMode    = input.string("Break of structure", "Mitigation rule", options = ["Wick touch", "Break of structure"], group = grpO)
+delMit     = input.bool(false,"Delete OB when mitigated",   group = grpO)
+
+grpV = "Volume"
+volLB      = input.int(100,  "Lookback for total volume",   minval = 10, group = grpV)
+showPct    = input.bool(true,"Show % of total volume",      group = grpV)
+showRetest = input.bool(true,"Show retest volume (separate)", group = grpV)
+minPct     = input.float(0.0,"Hide OBs below % strength",   minval = 0, maxval = 100, step = 0.5, group = grpV)
+labSize    = input.string("small", "Label size", options = ["tiny","small","normal","large"], group = grpV)
+
+grpT = "MTF Bias Table"
+showTable  = input.bool(true, "Show bias table",            group = grpT)
+biasLen    = input.int(50,    "Bias EMA length",            minval = 2, group = grpT)
+tf1        = input.timeframe("15", "TF 1", group = grpT)
+tf2        = input.timeframe("60", "TF 2", group = grpT)
+tf3        = input.timeframe("240","TF 3", group = grpT)
+tf4        = input.timeframe("D",  "TF 4", group = grpT)
+tblPos     = input.string("Top Right", "Position", options = ["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right"], group = grpT)
+
+grpC = "Colors"
+bullCol    = input.color(color.new(#089981, 78), "Bullish OB", group = grpC)
+bearCol    = input.color(color.new(#f23645, 78), "Bearish OB", group = grpC)
+midCol     = input.color(color.new(#787b86, 40), "Equilibrium", group = grpC)
+txtCol     = input.color(#787b86, "Label text", group = grpC)
+
+// ---------------------------------------------------------------------
+// TYPES
+// ---------------------------------------------------------------------
+type OB
+    box   bx
+    box   mid
+    label lb
+    float top
+    float bot
+    float obVol
+    float rtVol
+    float pct
+    bool  bull
+    bool  mitigated
+    bool  inside
+    bool  wasInside
+
+var array<OB> obs = array.new<OB>()
+
+// ---------------------------------------------------------------------
+// HELPERS
+// ---------------------------------------------------------------------
+fmtVol(float v) =>
+    a = math.abs(v)
+    a >= 1e9 ? str.tostring(v / 1e9, "#.###") + "B" :
+     a >= 1e6 ? str.tostring(v / 1e6, "#.###") + "M" :
+     a >= 1e3 ? str.tostring(v / 1e3, "#.###") + "K" : str.tostring(v, "#.##")
+
+labSz = labSize == "tiny" ? size.tiny : labSize == "small" ? size.small : labSize == "normal" ? size.normal : size.large
+
+obText(OB o) =>
+    base = fmtVol(o.obVol) + (showPct ? "  (" + str.tostring(o.pct, "#") + "%)" : "")
+    showRetest and o.rtVol > 0 ? base + "   R:" + fmtVol(o.rtVol) : base
+
+// ---------------------------------------------------------------------
+// STRUCTURE ENGINE
+// ---------------------------------------------------------------------
+atr = ta.atr(atrLen)
+ph  = ta.pivothigh(swingLen, swingLen)
+pl  = ta.pivotlow(swingLen, swingLen)
+
+var float lastPH    = na
+var float lastPL    = na
+var bool  phTaken   = true
+var bool  plTaken   = true
+var int   lastDir   = 0          // 1 = last break was bullish, -1 = bearish
+
+if not na(ph)
+    lastPH  := ph
+    phTaken := false
+if not na(pl)
+    lastPL  := pl
+    plTaken := false
+
+// displacement = body of the breaking candle vs ATR
+disp = math.abs(close - open) >= atr * dispMult
+dispOK = not useDisp or disp
+
+bullBreak = not na(lastPH) and not phTaken and close > lastPH and dispOK
+bearBreak = not na(lastPL) and not plTaken and close < lastPL and dispOK
+
+// ---------------------------------------------------------------------
+// OB CREATION
+// ---------------------------------------------------------------------
+countSide(bool bull) =>
+    int c = 0
+    if array.size(obs) > 0
+        for i = 0 to array.size(obs) - 1
+            o = array.get(obs, i)
+            if o.bull == bull and not o.mitigated
+                c += 1
+    c
+
+trimSide(bool bull) =>
+    // remove the oldest OB of this side if over the cap
+    if countSide(bull) > maxOB
+        for i = 0 to array.size(obs) - 1
+            o = array.get(obs, i)
+            if o.bull == bull and not o.mitigated
+                box.delete(o.bx)
+                if not na(o.mid)
+                    box.delete(o.mid)
+                label.delete(o.lb)
+                array.remove(obs, i)
+                break
+
+makeOB(bool bull) =>
+    int idx = na
+    // walk back for the last opposite-colour candle
+    for i = 1 to obSearch
+        if bull and close[i] < open[i]
+            idx := i
+            break
+        if not bull and close[i] > open[i]
+            idx := i
+            break
+
+    if not na(idx)
+        float t = useWick ? high[idx] : math.max(open[idx], close[idx])
+        float b = useWick ? low[idx]  : math.min(open[idx], close[idx])
+
+        // formation volume: OB candle -> break candle
+        float v = 0.0
+        for j = 0 to idx
+            v += volume[j]
+
+        float tot = math.sum(volume, volLB)
+        float pct = tot > 0 ? v / tot * 100 : 0
+
+        if pct >= minPct
+            int left  = bar_index - idx
+            int right = bar_index + extendBars
+            col = bull ? bullCol : bearCol
+
+            bx = box.new(left, t, right, b, border_color = color.new(col, 40), bgcolor = col)
+
+            float mTop = (t + b) / 2 + (t - b) * 0.04
+            float mBot = (t + b) / 2 - (t - b) * 0.04
+            box mb = na
+            if showMid
+                mb := box.new(left, mTop, right, mBot, border_color = color.new(midCol, 100), bgcolor = midCol)
+
+            lb = label.new(right, bull ? b : t, "", xloc = xloc.bar_index,
+                 style = bull ? label.style_label_left : label.style_label_left,
+                 color = color.new(color.white, 100), textcolor = txtCol, size = labSz)
+
+            OB o = OB.new(bx, mb, lb, t, b, v, 0.0, pct, bull, false, false, false)
+            label.set_text(lb, obText(o))
+            array.push(obs, o)
+            trimSide(bull)
+
+if bullBreak
+    makeOB(true)
+    phTaken := true
+    if showBOS
+        label.new(bar_index, low - atr * 0.6, lastDir == -1 ? "CHoCH" : "BOS",
+             style = label.style_label_up, color = color.new(color.white, 100),
+             textcolor = #089981, size = size.tiny)
+    lastDir := 1
+
+if bearBreak
+    makeOB(false)
+    plTaken := true
+    if showBOS
+        label.new(bar_index, high + atr * 0.6, lastDir == 1 ? "CHoCH" : "BOS",
+             style = label.style_label_down, color = color.new(color.white, 100),
+             textcolor = #f23645, size = size.tiny)
+    lastDir := -1
+
+// ---------------------------------------------------------------------
+// LIVE UPDATE: retest volume, extension, mitigation
+// ---------------------------------------------------------------------
+if array.size(obs) > 0
+    for i = array.size(obs) - 1 to 0
+        o = array.get(obs, i)
+        if not o.mitigated
+            // --- price tapping into the zone? accumulate RETEST volume only
+            touching = low <= o.top and high >= o.bot
+            o.wasInside := o.inside
+            if touching and bar_index > box.get_left(o.bx)
+                o.rtVol := o.rtVol + volume
+                o.inside := true
+                label.set_text(o.lb, obText(o))
+            else
+                o.inside := false
+
+            // --- keep the box travelling with price
+            box.set_right(o.bx, bar_index + extendBars)
+            if showMid and not na(o.mid)
+                box.set_right(o.mid, bar_index + extendBars)
+            label.set_x(o.lb, bar_index + extendBars)
+
+            // --- mitigation
+            bool mit = mitMode == "Wick touch" ?
+                 (o.bull ? low < o.bot : high > o.top) :
+                 (o.bull ? close < o.bot : close > o.top)
+
+            if mit
+                o.mitigated := true
+                if delMit
+                    box.delete(o.bx)
+                    if not na(o.mid)
+                        box.delete(o.mid)
+                    label.delete(o.lb)
+                    array.remove(obs, i)
+                else
+                    box.set_bgcolor(o.bx, color.new(color.gray, 92))
+                    box.set_border_color(o.bx, color.new(color.gray, 70))
+                    box.set_right(o.bx, bar_index)
+                    if not na(o.mid)
+                        box.delete(o.mid)
+                    label.set_x(o.lb, bar_index)
+                    label.set_textcolor(o.lb, color.new(txtCol, 50))
+
+// ---------------------------------------------------------------------
+// MTF BIAS TABLE
+// ---------------------------------------------------------------------
+f_bias() =>
+    e = ta.ema(close, biasLen)
+    close > e ? 1 : -1
+
+b1 = request.security(syminfo.tickerid, tf1, f_bias(), lookahead = barmerge.lookahead_off)
+b2 = request.security(syminfo.tickerid, tf2, f_bias(), lookahead = barmerge.lookahead_off)
+b3 = request.security(syminfo.tickerid, tf3, f_bias(), lookahead = barmerge.lookahead_off)
+b4 = request.security(syminfo.tickerid, tf4, f_bias(), lookahead = barmerge.lookahead_off)
+
+pos = tblPos == "Top Right" ? position.top_right : tblPos == "Top Left" ? position.top_left : tblPos == "Bottom Right" ? position.bottom_right : tblPos == "Bottom Left" ? position.bottom_left : position.middle_right
+
+var table t = table.new(pos, 2, 6, border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 60))
+
+cellBias(int row, string tfName, int b) =>
+    table.cell(t, 0, row, tfName, text_color = txtCol, text_size = size.small, bgcolor = color.new(color.gray, 90))
+    table.cell(t, 1, row, b == 1 ? "BULLISH" : "BEARISH",
+         text_color = b == 1 ? #089981 : #f23645, text_size = size.small, bgcolor = color.new(color.gray, 90))
+
+if showTable and barstate.islast
+    table.cell(t, 0, 0, "TF", text_color = txtCol, text_size = size.small, bgcolor = color.new(color.gray, 80))
+    table.cell(t, 1, 0, "BIAS", text_color = txtCol, text_size = size.small, bgcolor = color.new(color.gray, 80))
+    cellBias(1, tf1, b1)
+    cellBias(2, tf2, b2)
+    cellBias(3, tf3, b3)
+    cellBias(4, tf4, b4)
+    net = b1 + b2 + b3 + b4
+    table.cell(t, 0, 5, "NET", text_color = txtCol, text_size = size.small, bgcolor = color.new(color.gray, 80))
+    table.cell(t, 1, 5, net > 0 ? "BULLISH" : net < 0 ? "BEARISH" : "MIXED",
+         text_color = net > 0 ? #089981 : net < 0 ? #f23645 : color.gray,
+         text_size = size.small, bgcolor = color.new(color.gray, 80))
+
+// ---------------------------------------------------------------------
+// ALERTS
+// ---------------------------------------------------------------------
+bool alertTouch = false
+if array.size(obs) > 0
+    for i = 0 to array.size(obs) - 1
+        o = array.get(obs, i)
+        if not o.mitigated and o.inside and not o.wasInside
+            alertTouch := true
+
+alertcondition(alertTouch, "OB Retest", "Price is retesting an order block")
+alertcondition(bullBreak,  "Bullish BOS", "Bullish break of structure")
+alertcondition(bearBreak,  "Bearish BOS", "Bearish break of structure")
