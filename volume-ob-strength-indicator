@@ -304,16 +304,17 @@ if showTable and barstate.islast
 basePct = 100.0 / volLB                       // 2.5% when volLB = 40
 
 f_mult(float p)  => basePct > 0 ? p / basePct : 0.0
-f_label(float m) => m >= 10 ? "EXTREME"     :
-                    m >= 6  ? "VERY STRONG" :
-                    m >= 4  ? "STRONG"      :
-                    m >= 3  ? "SOLID"       :
-                    m >= 2  ? "MINIMUM"     : "NOISE"
+f_label(float m) => m >= 10 ? "EXTREME" : 
+  m >= 6  ? "VERY STRONG" :
+  m >= 4  ? "STRONG"      : 
+  m >= 3  ? "SOLID"       : 
+  m >= 2  ? "MINIMUM"     : "NOISE"               
+                    
 f_col(float m)   => m >= 10 ? #d500f9 :
-                    m >= 6  ? #00e676 :
-                    m >= 4  ? #089981 :
-                    m >= 3  ? #26a69a :
-                    m >= 2  ? #ff9800 : #787b86
+  m >= 6  ? #00e676 :
+  m >= 4  ? #089981 :
+  m >= 3  ? #26a69a :
+  m >= 2  ? #ff9800 : #787b86
 
 // --- sessions ---------------------------------------------------------
 inAsia = not na(time(timeframe.period, sessAsia, tzStr))
@@ -333,14 +334,15 @@ int barsSinceLdn = ta.barssince(ldnOpen)
 warming = showWarn and not na(barsSinceLdn) and barsSinceLdn < volLB and (inLdn or inNY)
 
 // --- most recently created OB ----------------------------------------
-float lastPctV  = na
-bool  lastBullV = na
+float lastPctV = na
+int   lastSide = 0          // 0 = none, 1 = bullish, -1 = bearish
 if array.size(obs) > 0
-    OB lastO = array.get(obs, array.size(obs) - 1)
-    lastPctV  := lastO.pct
-    lastBullV := lastO.bull
+    lastO = array.get(obs, array.size(obs) - 1)
+    lastPctV := lastO.pct
+    lastSide := lastO.bull ? 1 : -1
 
-lastMult = na(lastPctV) ? na : f_mult(lastPctV)
+float lastMult = na(lastPctV) ? na : f_mult(lastPctV)
+
 
 // --- panel build ------------------------------------------------------
 pPos = panelPos == "Top Right"    ? position.top_right    :
@@ -374,8 +376,8 @@ if showPanel and barstate.islast
     lastTxt  = na(lastPctV) ? "—" : str.tostring(lastPctV, "#.#") + "%"
     multTxt  = na(lastMult) ? "—" : str.tostring(lastMult, "#.#") + "x  " + f_label(lastMult)
     multColr = na(lastMult) ? txtCol : f_col(lastMult)
-    sideTxt  = na(lastBullV) ? "LAST OB" : (lastBullV ? "LAST OB  ▲" : "LAST OB  ▼")
-    sideColr = na(lastBullV) ? txtCol : (lastBullV ? #089981 : #f23645)
+    sideTxt  = lastSide == 0 ? "LAST OB" : lastSide == 1 ? "LAST OB  ▲" : "LAST OB  ▼"
+    sideColr = lastSide == 0 ? txtCol    : lastSide == 1 ? #089981      : #f23645
 
     pCell(0, 2, sideTxt, sideColr, rowBg)
     pCell(1, 2, lastTxt, multColr, rowBg)
