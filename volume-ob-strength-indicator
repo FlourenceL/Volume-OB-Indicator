@@ -5,6 +5,7 @@
 //  - Measures FORMATION volume inside the block  -> "1.105K (16%)"
 //  - Measures RETEST volume separately           -> "R: 0.42K"
 //  - Multi-timeframe bias table (15m / 1H / 4H / 1D)
+//  - Volume Strength panel: session, required %, last OB read, legend
 // =====================================================================
 indicator("OB + Volume Strength", "OB+VOL", overlay = true,
      max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
@@ -29,10 +30,10 @@ mitMode    = input.string("Break of structure", "Mitigation rule", options = ["W
 delMit     = input.bool(false,"Delete OB when mitigated",   group = grpO)
 
 grpV = "Volume"
-volLB      = input.int(35,  "Lookback for total volume",   minval = 10, group = grpV)
+volLB      = input.int(40,  "Lookback for total volume",    minval = 10, group = grpV)
 showPct    = input.bool(true,"Show % of total volume",      group = grpV)
 showRetest = input.bool(true,"Show retest volume (separate)", group = grpV)
-minPct     = input.float(5,"Hide OBs below % strength",   minval = 0, maxval = 100, step = 0.5, group = grpV)
+minPct     = input.float(0, "Hide OBs below % strength",    minval = 0, maxval = 100, step = 0.5, group = grpV)
 labSize    = input.string("small", "Label size", options = ["tiny","small","normal","large"], group = grpV)
 
 grpT = "MTF Bias Table"
@@ -43,6 +44,23 @@ tf2        = input.timeframe("60", "TF 2", group = grpT)
 tf3        = input.timeframe("240","TF 3", group = grpT)
 tf4        = input.timeframe("D",  "TF 4", group = grpT)
 tblPos     = input.string("Top Right", "Position", options = ["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right"], group = grpT)
+
+// ---------------------------------------------------------------------
+//  NEW: VOLUME STRENGTH PANEL
+// ---------------------------------------------------------------------
+grpP = "Strength Panel"
+showPanel  = input.bool(true,  "Show volume strength panel", group = grpP)
+showLegend = input.bool(true,  "Show strength legend",       group = grpP)
+showWarn   = input.bool(true,  "Show session warnings",      group = grpP)
+panelPos   = input.string("Bottom Right", "Panel position",
+             options = ["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right","Middle Left"], group = grpP)
+panelSize  = input.string("tiny", "Panel text size", options = ["tiny","small","normal"], group = grpP)
+tzStr      = input.string("GMT+8", "Session timezone", group = grpP)
+sessAsia   = input.session("0800-1600", "Asian session",  group = grpP)
+sessLdn    = input.session("1500-0000", "London session", group = grpP)
+sessNY     = input.session("2030-0500", "New York session", group = grpP)
+multAsia   = input.float(2.0, "Asian: min multiple",     minval = 1, step = 0.5, group = grpP)
+multLdnNY  = input.float(3.0, "London/NY: min multiple", minval = 1, step = 0.5, group = grpP)
 
 grpC = "Colors"
 bullCol    = input.color(color.new(#089981, 78), "Bullish OB", group = grpC)
@@ -277,6 +295,138 @@ if showTable and barstate.islast
     table.cell(t, 1, 5, net > 0 ? "BULLISH" : net < 0 ? "BEARISH" : "MIXED",
          text_color = net > 0 ? #089981 : net < 0 ? #f23645 : color.gray,
          text_size = size.small, bgcolor = color.new(color.gray, 80))
+
+// =====================================================================
+//  VOLUME STRENGTH PANEL
+// =====================================================================
+
+// --- baseline: one average candle's share of the volLB window ---------
+basePct = 100.0 / volLB                       // 2.5% when volLB = 40
+
+f_mult(float p)  => basePct > 0 ? p / basePct : 0.0
+f_label(float m) => m >= 10 ? "EXTREME"     :
+                    m >= 6  ? "VERY STRONG" :
+                    m >= 4  ? "STRONG"      :
+                    m >= 3  ? "SOLID"       :
+                    m >= 2  ? "MINIMUM"     : "NOISE"
+f_col(float m)   => m >= 10 ? #d500f9 :
+                    m >= 6  ? #00e676 :
+                    m >= 4  ? #089981 :
+                    m >= 3  ? #26a69a :
+                    m >= 2  ? #ff9800 : #787b86
+
+// --- sessions ---------------------------------------------------------
+inAsia = not na(time(timeframe.period, sessAsia, tzStr))
+inLdn  = not na(time(timeframe.period, sessLdn,  tzStr))
+inNY   = not na(time(timeframe.period, sessNY,   tzStr))
+
+sessName = inNY ? "NEW YORK" : inLdn ? "LONDON" : inAsia ? "ASIAN" : "OFF-HOURS"
+sessCol  = inNY or inLdn ? #f23645 : inAsia ? #ff9800 : #787b86
+
+// required multiple for the active session
+reqMult = (inNY or inLdn) ? multLdnNY : inAsia ? multAsia : multLdnNY
+reqPct  = reqMult * basePct
+
+// --- "window warming" trap: volLB bars after London open --------------
+ldnOpen = inLdn and not inLdn[1]
+int barsSinceLdn = ta.barssince(ldnOpen)
+warming = showWarn and not na(barsSinceLdn) and barsSinceLdn < volLB and (inLdn or inNY)
+
+// --- most recently created OB ----------------------------------------
+float lastPctV  = na
+bool  lastBullV = na
+if array.size(obs) > 0
+    OB lastO = array.get(obs, array.size(obs) - 1)
+    lastPctV  := lastO.pct
+    lastBullV := lastO.bull
+
+lastMult = na(lastPctV) ? na : f_mult(lastPctV)
+
+// --- panel build ------------------------------------------------------
+pPos = panelPos == "Top Right"    ? position.top_right    :
+       panelPos == "Top Left"     ? position.top_left     :
+       panelPos == "Bottom Right" ? position.bottom_right :
+       panelPos == "Bottom Left"  ? position.bottom_left  :
+       panelPos == "Middle Right" ? position.middle_right : position.middle_left
+
+pSz = panelSize == "tiny" ? size.tiny : panelSize == "small" ? size.small : size.normal
+
+var table p = table.new(pPos, 3, 13, border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 60))
+
+hdrBg  = color.new(color.gray, 75)
+rowBg  = color.new(color.gray, 90)
+
+pCell(int c, int r, string txt, color tc, color bg) =>
+    table.cell(p, c, r, txt, text_color = tc, text_size = pSz, bgcolor = bg)
+
+if showPanel and barstate.islast
+    // ---- title
+    pCell(0, 0, "VOLUME STRENGTH", txtCol, hdrBg)
+    pCell(1, 0, "", txtCol, hdrBg)
+    pCell(2, 0, "base " + str.tostring(basePct, "#.##") + "% = 1x", txtCol, hdrBg)
+
+    // ---- live: session + required threshold
+    pCell(0, 1, "SESSION", txtCol, rowBg)
+    pCell(1, 1, sessName, sessCol, rowBg)
+    pCell(2, 1, "need " + str.tostring(reqPct, "#.#") + "%  (" + str.tostring(reqMult, "#.#") + "x)", txtCol, rowBg)
+
+    // ---- live: last OB reading
+    lastTxt  = na(lastPctV) ? "—" : str.tostring(lastPctV, "#.#") + "%"
+    multTxt  = na(lastMult) ? "—" : str.tostring(lastMult, "#.#") + "x  " + f_label(lastMult)
+    multColr = na(lastMult) ? txtCol : f_col(lastMult)
+    sideTxt  = na(lastBullV) ? "LAST OB" : (lastBullV ? "LAST OB  ▲" : "LAST OB  ▼")
+    sideColr = na(lastBullV) ? txtCol : (lastBullV ? #089981 : #f23645)
+
+    pCell(0, 2, sideTxt, sideColr, rowBg)
+    pCell(1, 2, lastTxt, multColr, rowBg)
+    pCell(2, 2, multTxt, multColr, rowBg)
+
+    // ---- verdict vs session requirement
+    verdict = na(lastMult) ? "—" : lastMult >= reqMult ? "PASSES session filter" : "BELOW session filter"
+    vCol    = na(lastMult) ? txtCol : lastMult >= reqMult ? #089981 : #f23645
+    pCell(0, 3, "VERDICT", txtCol, rowBg)
+    pCell(1, 3, "", txtCol, rowBg)
+    pCell(2, 3, verdict, vCol, rowBg)
+
+    // ---- warning row
+    warnTxt = warming ?
+         "⚠ Window warming " + str.tostring(barsSinceLdn) + "/" + str.tostring(volLB) + " — % inflated" :
+         "✓ Window settled"
+    warnCol = warming ? #ff9800 : #089981
+    pCell(0, 4, "WARNING", txtCol, rowBg)
+    pCell(1, 4, "", txtCol, rowBg)
+    pCell(2, 4, warnTxt, warnCol, rowBg)
+
+    // ---- legend
+    if showLegend
+        pCell(0, 5, "%",    txtCol, hdrBg)
+        pCell(1, 5, "MULT", txtCol, hdrBg)
+        pCell(2, 5, "READ", txtCol, hdrBg)
+
+        mArr = array.from(1.0, 2.0, 3.0, 4.0, 6.0, 10.0)
+        rArr = array.from("Nothing. Noise candle.",
+                          "Minimum worth marking",
+                          "Solid — real participation",
+                          "Strong",
+                          "Very strong",
+                          "Extreme — displacement/news")
+
+        for i = 0 to 5
+            m    = array.get(mArr, i)
+            last = i == 5
+            // highlight the band the current OB falls into
+            hit  = not na(lastMult) and lastMult >= m and (last or lastMult < array.get(mArr, i + 1))
+            bg   = hit ? color.new(f_col(m), 65) : rowBg
+            tc   = hit ? color.white : f_col(m)
+
+            pCell(0, i + 6, str.tostring(m * basePct, "#.#") + (last ? "%+" : "%"), tc, bg)
+            pCell(1, i + 6, str.tostring(m, "#.#") + "x" + (last ? "+" : ""),       tc, bg)
+            pCell(2, i + 6, array.get(rArr, i),                                     tc, bg)
+
+        // ---- session rule footer
+        pCell(0, 12, "RULE", txtCol, hdrBg)
+        pCell(1, 12, "", txtCol, hdrBg)
+        pCell(2, 12, "Asian " + str.tostring(multAsia, "#.#") + "x  |  Ldn/NY " + str.tostring(multLdnNY, "#.#") + "x", txtCol, hdrBg)
 
 // ---------------------------------------------------------------------
 // ALERTS
